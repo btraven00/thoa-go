@@ -23,6 +23,9 @@ type fake struct {
 	decrements int
 	totalSize  int64
 	flaky      int // blob and API GET requests that answered 503
+	// noContext answers like the real server for imported datasets: an empty
+	// adjusted_context, paths only as /files filenames.
+	noContext bool
 }
 
 // fakeThoa emulates the API endpoints and Azure SAS blob calls the client
@@ -33,7 +36,9 @@ func fakeThoa(t *testing.T) *fake {
 	blocks := map[string][]byte{}
 	blobs := map[string][]byte{}
 	meta := map[string]string{}
-	context := map[string]string{} // dataset path -> file id (= md5)
+	context := map[string]string{}  // dataset path -> file id (= md5)
+	names := map[string]string{}    // file id -> filename sent on complete
+	itemFile := map[string]string{} // item public id -> file id
 	n := 0
 
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -98,6 +103,7 @@ func fakeThoa(t *testing.T) *fake {
 			for i, it := range req.Items {
 				id := it["md5"].(string)
 				context[it["mount_path"].(string)] = id
+				itemFile[fmt.Sprint(i)] = id
 				items = append(items, map[string]any{
 					"provider": "local", "path": it["path"], "upload_required": true,
 					"upload_url": f.srv.URL + "/blob/" + id + "?sig=x", "item_public_id": fmt.Sprint(i),
@@ -107,15 +113,24 @@ func fakeThoa(t *testing.T) *fake {
 		case p == "/api/data-transfers/t1/manifest":
 			reply(map[string]any{"status": "completed", "total_items": len(context), "completed_paths": []string{}})
 		case p == "/api/data-transfers/t1/resolved-context":
-			reply(map[string]string{"dataset_public_id": "ds1"})
+			reply(map[string]any{"dataset_public_id": "ds1", "input_context": context})
 		case p == "/api/datasets":
-			reply([]map[string]any{{"remaining_downloads": 1, "total_size": f.totalSize, "adjusted_context": context}})
+			ctx := context
+			if f.noContext {
+				ctx = map[string]string{}
+			}
+			reply([]map[string]any{{"remaining_downloads": 1, "total_size": f.totalSize, "adjusted_context": ctx}})
 		case p == "/api/files":
 			var list []map[string]any
 			for _, id := range context {
-				list = append(list, map[string]any{"public_id": id, "size": len(blobs[id])})
+				list = append(list, map[string]any{"public_id": id, "size": len(blobs[id]), "filename": names[id], "hash": id})
 			}
 			reply(list)
+		case strings.HasSuffix(p, "/complete"):
+			var body struct{ Filename string }
+			json.NewDecoder(r.Body).Decode(&body)
+			names[itemFile[strings.Split(p, "/")[6]]] = body.Filename
+			reply(map[string]any{})
 		case strings.HasPrefix(p, "/api/temporary_links/"):
 			id := strings.Split(p, "/")[3]
 			reply(map[string]string{"url": f.srv.URL + "/blob/" + id + "?sig=x"})
@@ -266,5 +281,45 @@ func TestDatasetPaths(t *testing.T) {
 	c := &Client{}
 	if _, err := c.Upload(map[string]string{"/abs/x": "x"}); err == nil {
 		t.Errorf("Upload must reject absolute dataset paths")
+	}
+}
+
+// Imported datasets have no adjusted_context: paths come from the filenames
+// Upload reported, which must be the dataset paths, not the local ones.
+func TestRoundTripWithoutContext(t *testing.T) {
+	f := fakeThoa(t)
+	f.noContext = true
+	c := &Client{BaseURL: f.srv.URL, APIKey: "k", HTTP: f.srv.Client(), Blob: f.srv.Client()}
+	Log, retryBackoff, Parallel = nil, time.Millisecond, 4
+
+	src := t.TempDir()
+	os.MkdirAll(filepath.Join(src, "sub"), 0o755)
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("hello"), 0o644)
+	os.WriteFile(filepath.Join(src, "sub", "b.txt"), []byte("world"), 0o644)
+	id, err := c.Upload(map[string]string{"a.txt": filepath.Join(src, "a.txt"), "sub/b.txt": filepath.Join(src, "sub", "b.txt")})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := c.Files(id)
+	if err != nil || len(files) != 2 || files["a.txt"] == "" || files["sub/b.txt"] == "" {
+		t.Fatalf("files = %v, %v; want the dataset paths", files, err)
+	}
+	info, err := c.DatasetFiles(id)
+	if err != nil || len(info) != 2 {
+		t.Fatalf("DatasetFiles = %v, %v", info, err)
+	}
+	for _, fi := range info {
+		if sum := md5.Sum([]byte(map[string]string{"a.txt": "hello", "sub/b.txt": "world"}[fi.Name])); fi.MD5 != fmt.Sprintf("%x", sum) || fi.Size != 5 {
+			t.Errorf("%+v: wrong md5 or size", fi)
+		}
+	}
+
+	dst := t.TempDir()
+	if res, err := c.Download(id, dst, nil, nil); err != nil || res.Downloaded != 2 {
+		t.Fatalf("download: %+v %v", res, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dst, "sub", "b.txt")); string(b) != "world" {
+		t.Errorf("sub/b.txt = %q", b)
 	}
 }

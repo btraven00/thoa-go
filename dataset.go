@@ -168,7 +168,8 @@ func (c *Client) Upload(files map[string]string) (string, error) {
 		}
 		// ponytail: not retried, unknown whether the server treats a repeat as idempotent
 		return c.do("POST", "/data-transfers/"+tid+"/import/items/"+it.ItemPublicID+"/complete", nil,
-			map[string]any{"filename": f.path, "checksum": f.md5, "size": f.size}, nil)
+			// The server names the file after this, not after mount_path.
+			map[string]any{"filename": f.name, "checksum": f.md5, "size": f.size}, nil)
 	})
 	if err != nil {
 		return "", err
@@ -181,10 +182,23 @@ func (c *Client) Upload(files map[string]string) (string, error) {
 		return "", err
 	}
 	var resolved struct {
-		DatasetPublicID string `json:"dataset_public_id"`
+		DatasetPublicID string            `json:"dataset_public_id"`
+		InputContext    map[string]string `json:"input_context"` // mount path -> file id
 	}
 	err = retry(func() error { return c.do("GET", "/data-transfers/"+tid+"/resolved-context", nil, nil, &resolved) })
-	return resolved.DatasetPublicID, err
+	if err != nil {
+		return "", err
+	}
+	// The python client hands input_context to the job; the dataset itself keeps
+	// no path map after an import. Check it maps exactly the paths we sent.
+	if len(resolved.InputContext) > 0 {
+		for _, f := range list {
+			if resolved.InputContext[f.name] == "" {
+				return resolved.DatasetPublicID, fmt.Errorf("dataset %s: %s missing from the import's input_context", resolved.DatasetPublicID, f.name)
+			}
+		}
+	}
+	return resolved.DatasetPublicID, nil
 }
 
 // PollInterval is how often transfer status is polled.
@@ -305,7 +319,57 @@ func (c *Client) Files(datasetID string) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ds.AdjustedContext, nil
+	return c.paths(datasetID, ds)
+}
+
+// FileInfo is one file of a dataset as /files reports it.
+type FileInfo struct {
+	Name string // path inside the dataset (the name it was uploaded under)
+	ID   string
+	Size int64
+	MD5  string // hex
+}
+
+// DatasetFiles lists a dataset's files with size and md5, from /files.
+func (c *Client) DatasetFiles(datasetID string) ([]FileInfo, error) {
+	var list []struct {
+		PublicID string `json:"public_id"`
+		Filename string `json:"filename"`
+		Size     *int64 `json:"size"`
+		Hash     string `json:"hash"`
+	}
+	q := url.Values{"dataset_public_id": {datasetID}}
+	if err := retry(func() error { return c.do("GET", "/files", q, nil, &list) }); err != nil {
+		return nil, err
+	}
+	out := make([]FileInfo, 0, len(list))
+	for _, f := range list {
+		fi := FileInfo{Name: f.Filename, ID: f.PublicID, MD5: normalizeMD5(f.Hash)}
+		if f.Size != nil {
+			fi.Size = *f.Size
+		}
+		out = append(out, fi)
+	}
+	return out, nil
+}
+
+// paths maps dataset path -> file id. An imported dataset keeps no path map
+// (adjusted_context is empty; the python client only passes the import's
+// input_context to its job), so its paths come from the file names /files
+// reports, which Upload sets to the dataset paths.
+func (c *Client) paths(datasetID string, ds *datasetInfo) (map[string]string, error) {
+	if len(ds.AdjustedContext) > 0 {
+		return ds.AdjustedContext, nil
+	}
+	list, err := c.DatasetFiles(datasetID)
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string]string, len(list))
+	for _, f := range list {
+		m[f.Name] = f.ID
+	}
+	return m, nil
 }
 
 // Tree renders path -> file id as a tree, like `thoa dataset ls`; level <= 0
@@ -410,7 +474,11 @@ func (c *Client) Download(datasetID, dest string, include, exclude []string) (*D
 	if ds.RemainingDownloads <= 0 {
 		return nil, fmt.Errorf("dataset %s has no remaining downloads", datasetID)
 	}
-	files := filterFiles(ds.AdjustedContext, include, exclude)
+	all, err := c.paths(datasetID, ds)
+	if err != nil {
+		return nil, err
+	}
+	files := filterFiles(all, include, exclude)
 	if len(files) == 0 {
 		return nil, fmt.Errorf("dataset %s: no files (after include/exclude)", datasetID)
 	}
