@@ -322,4 +322,19 @@ func TestRoundTripWithoutContext(t *testing.T) {
 	if b, _ := os.ReadFile(filepath.Join(dst, "sub", "b.txt")); string(b) != "world" {
 		t.Errorf("sub/b.txt = %q", b)
 	}
+
+	// By file id, from the import's context: independent of filenames, which
+	// keep whatever an earlier upload of the same content named them.
+	id2, ctx, err := c.UploadContext(map[string]string{"x/a.txt": filepath.Join(src, "a.txt")})
+	if err != nil || ctx["x/a.txt"] == "" {
+		t.Fatalf("UploadContext = %q %v %v", id2, ctx, err)
+	}
+	dst2 := t.TempDir()
+	// (the fake keeps one context for all uploads, so pick our path)
+	if res, err := c.DownloadFiles(id2, map[string]string{"x/a.txt": ctx["x/a.txt"]}, dst2); err != nil || res.Downloaded != 1 {
+		t.Fatalf("DownloadFiles: %+v %v", res, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dst2, "x", "a.txt")); string(b) != "hello" {
+		t.Errorf("x/a.txt = %q", b)
+	}
 }

@@ -81,26 +81,34 @@ func validName(name string) bool {
 // (relative, slash-separated, e.g. "counts/matrix.h5ad") to local file path;
 // DatasetPaths builds it from CLI-style arguments.
 func (c *Client) Upload(files map[string]string) (string, error) {
+	id, _, err := c.UploadContext(files)
+	return id, err
+}
+
+// UploadContext is Upload, also returning the import's input_context:
+// dataset path -> file id. Keep it: an imported dataset stores no path map,
+// and DownloadFiles needs one.
+func (c *Client) UploadContext(files map[string]string) (string, map[string]string, error) {
 	if len(files) == 0 {
-		return "", fmt.Errorf("no files to upload")
+		return "", nil, fmt.Errorf("no files to upload")
 	}
 	list := make([]localFile, 0, len(files))
 	locals := map[string]string{}
 	for name, p := range files {
 		if !validName(name) {
-			return "", fmt.Errorf("invalid dataset path %q: must be relative and clean", name)
+			return "", nil, fmt.Errorf("invalid dataset path %q: must be relative and clean", name)
 		}
 		// the manifest echoes items back by local path, so one local file per dataset
 		if prev, ok := locals[p]; ok {
-			return "", fmt.Errorf("%s mapped to both %q and %q", p, prev, name)
+			return "", nil, fmt.Errorf("%s mapped to both %q and %q", p, prev, name)
 		}
 		locals[p] = name
 		st, err := os.Stat(p)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 		if !st.Mode().IsRegular() {
-			return "", fmt.Errorf("%s: not a regular file", p)
+			return "", nil, fmt.Errorf("%s: not a regular file", p)
 		}
 		list = append(list, localFile{name: name, path: p, size: st.Size()})
 	}
@@ -112,7 +120,7 @@ func (c *Client) Upload(files map[string]string) (string, error) {
 		return err
 	})
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	byPath := map[string]*localFile{}
 	items := make([]map[string]any, len(list))
@@ -126,7 +134,7 @@ func (c *Client) Upload(files map[string]string) (string, error) {
 		PublicID string `json:"public_id"`
 	}
 	if err := c.do("POST", "/data-transfers", nil, map[string]any{"direction": "import", "remote_ref": map[string]any{}}, &transfer); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	tid := transfer.PublicID
 
@@ -141,7 +149,7 @@ func (c *Client) Upload(files map[string]string) (string, error) {
 		Items []item `json:"items"`
 	}
 	if err := c.do("POST", "/data-transfers/"+tid+"/manifest/unified", nil, map[string]any{"items": items}, &manifest); err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	var todo []item
@@ -154,7 +162,7 @@ func (c *Client) Upload(files map[string]string) (string, error) {
 			continue
 		}
 		if byPath[it.Path] == nil {
-			return "", fmt.Errorf("server returned unknown path %q", it.Path)
+			return "", nil, fmt.Errorf("server returned unknown path %q", it.Path)
 		}
 		todo = append(todo, it)
 	}
@@ -172,14 +180,14 @@ func (c *Client) Upload(files map[string]string) (string, error) {
 			map[string]any{"filename": f.name, "checksum": f.md5, "size": f.size}, nil)
 	})
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	if err := c.do("POST", "/data-transfers/"+tid+"/start", nil, nil, nil); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if err := c.waitTransfer(tid); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	var resolved struct {
 		DatasetPublicID string            `json:"dataset_public_id"`
@@ -187,18 +195,19 @@ func (c *Client) Upload(files map[string]string) (string, error) {
 	}
 	err = retry(func() error { return c.do("GET", "/data-transfers/"+tid+"/resolved-context", nil, nil, &resolved) })
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	// The python client hands input_context to the job; the dataset itself keeps
-	// no path map after an import. Check it maps exactly the paths we sent.
+	// The dataset itself keeps no path map after an import; input_context is the
+	// only record of it (the python client hands it to the job). Check it maps
+	// exactly the paths we sent.
 	if len(resolved.InputContext) > 0 {
 		for _, f := range list {
 			if resolved.InputContext[f.name] == "" {
-				return resolved.DatasetPublicID, fmt.Errorf("dataset %s: %s missing from the import's input_context", resolved.DatasetPublicID, f.name)
+				return resolved.DatasetPublicID, nil, fmt.Errorf("dataset %s: %s missing from the import's input_context", resolved.DatasetPublicID, f.name)
 			}
 		}
 	}
-	return resolved.DatasetPublicID, nil
+	return resolved.DatasetPublicID, resolved.InputContext, nil
 }
 
 // PollInterval is how often transfer status is polled.
@@ -482,8 +491,27 @@ func (c *Client) Download(datasetID, dest string, include, exclude []string) (*D
 	if len(files) == 0 {
 		return nil, fmt.Errorf("dataset %s: no files (after include/exclude)", datasetID)
 	}
+	return c.downloadFiles(datasetID, ds, files, dest, len(include)+len(exclude) > 0)
+}
 
-	if need := c.downloadSize(datasetID, ds, files, len(include)+len(exclude) > 0); need > 0 {
+// DownloadFiles fetches the given files of a dataset into dest, by file id:
+// files maps dataset path -> file id, e.g. the context UploadContext returned.
+func (c *Client) DownloadFiles(datasetID string, files map[string]string, dest string) (*DownloadResult, error) {
+	ds, err := c.dataset(datasetID)
+	if err != nil {
+		return nil, err
+	}
+	if ds.RemainingDownloads <= 0 {
+		return nil, fmt.Errorf("dataset %s has no remaining downloads", datasetID)
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("dataset %s: no files given", datasetID)
+	}
+	return c.downloadFiles(datasetID, ds, files, dest, true)
+}
+
+func (c *Client) downloadFiles(datasetID string, ds *datasetInfo, files map[string]string, dest string, filtered bool) (*DownloadResult, error) {
+	if need := c.downloadSize(datasetID, ds, files, filtered); need > 0 {
 		need += max(need/20, 200<<20)
 		if free, ok := freeBytes(dest); ok && free < need {
 			return nil, fmt.Errorf("insufficient disk space at %s: need %s (with headroom), have %s",
@@ -500,7 +528,7 @@ func (c *Client) Download(datasetID, dest string, include, exclude []string) (*D
 		idList = append(idList, id)
 	}
 	var mu sync.Mutex
-	err = forEach(len(idList), Parallel, func(i int) error {
+	err := forEach(len(idList), Parallel, func(i int) error {
 		var link struct {
 			URL    string `json:"url"`
 			SASURL string `json:"sas_url"`
