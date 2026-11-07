@@ -109,9 +109,12 @@ func firstNonEmpty(ss ...string) string {
 type APIError struct {
 	Status int
 	Detail string
+	Call   string // "METHOD /path", query omitted
 }
 
-func (e *APIError) Error() string { return fmt.Sprintf("thoa api: %d: %s", e.Status, e.Detail) }
+func (e *APIError) Error() string {
+	return fmt.Sprintf("thoa api: %s: %d: %s", e.Call, e.Status, e.Detail)
+}
 
 // do calls /api{path}; body (if non-nil) is sent as JSON, out (if non-nil)
 // receives the decoded JSON response.
@@ -152,7 +155,7 @@ func (c *Client) do(method, path string, q url.Values, body, out any) error {
 		if json.Unmarshal(b, &e) == nil && e.Detail != nil {
 			detail = fmt.Sprint(e.Detail)
 		}
-		return &APIError{resp.StatusCode, detail}
+		return &APIError{resp.StatusCode, detail, method + " " + path}
 	}
 	if out == nil {
 		return nil
