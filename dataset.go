@@ -331,6 +331,36 @@ func (c *Client) Files(datasetID string) (map[string]string, error) {
 	return c.paths(datasetID, ds)
 }
 
+// Select is Files filtered like Download (include/exclude: path globs or file
+// ids); a job's InputContext takes the result as is.
+func (c *Client) Select(datasetID string, include, exclude []string) (map[string]string, error) {
+	files, err := c.Files(datasetID)
+	if err != nil {
+		return nil, err
+	}
+	files = filterFiles(files, include, exclude)
+	if len(files) == 0 {
+		return nil, fmt.Errorf("dataset %s: no files selected", datasetID)
+	}
+	return files, nil
+}
+
+// View makes a new dataset over existing files (ids), moving no data: files
+// are shared, a dataset is a set of them. The new dataset has no path map
+// (thoa ignores a client-set context), so keep files' paths yourself.
+func (c *Client) View(ids []string) (string, error) {
+	if len(ids) == 0 {
+		return "", fmt.Errorf("view: no files")
+	}
+	var ds struct {
+		PublicID string `json:"public_id"`
+	}
+	if err := c.do("POST", "/datasets", nil, map[string]any{"files": ids}, &ds); err != nil {
+		return "", err
+	}
+	return ds.PublicID, nil
+}
+
 // FileInfo is one file of a dataset as /files reports it.
 type FileInfo struct {
 	Name string // path inside the dataset (the name it was uploaded under)
