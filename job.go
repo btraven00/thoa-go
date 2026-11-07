@@ -1,6 +1,7 @@
 package thoa
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -131,6 +132,15 @@ func (c *Client) job(id string) (*JobInfo, error) {
 		return nil, fmt.Errorf("job %s not found", id)
 	}
 	return &js[0], nil
+}
+
+// JobRecord is the job's detail record (status, env, datasets, attempts,
+// azure_cost_usd, billed_cost_usd, credits_debited). The costs are only
+// filled in here: GET /jobs leaves them null.
+func (c *Client) JobRecord(id string) (json.RawMessage, error) {
+	var rec json.RawMessage
+	err := retry(func() error { return c.do("GET", "/jobs/"+id+"/detail", nil, nil, &rec) })
+	return rec, err
 }
 
 // JobPoll is how often Wait polls job status.

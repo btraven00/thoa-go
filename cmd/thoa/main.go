@@ -3,6 +3,7 @@
 //	thoa ls [-l N] [DATASET_ID]
 //	thoa upload PATH...
 //	thoa download [-i PATTERN|ID]... [-e PATTERN|ID]... DATASET_ID DEST
+//	thoa job JOB_ID
 //	thoa view [-i X]... [-e X]... DATASET_ID
 //	thoa run -cmd CMD (-env FILE | -env-id ID) -out DIR [-in PATH]... [-d DATASET [-i X]... [-e X]...]
 package main
@@ -31,6 +32,7 @@ const usage = `usage:
                                          (a file is stored as its name, a dir DIR as base(DIR)/...)
   thoa download [-i X]... [-e X]... ID DEST
                                          download dataset ID into DEST; X is a path glob or file id
+  thoa job ID                            print a job's record as JSON (status, datasets, costs)
   thoa view [-i X]... [-e X]... ID      new dataset over the selected files of ID (no data moved);
                                          prints its id, then "path<TAB>file id" per file (it keeps no paths)
   thoa run -cmd CMD (-env FILE | -env-id ID) -out DIR [-in PATH]... [-d ID [-i X]... [-e X]...]
@@ -129,6 +131,15 @@ func main() {
 		if len(res.Failed) > 0 {
 			os.Exit(1)
 		}
+	case "job":
+		if fs.NArg() != 1 {
+			die(fmt.Errorf("job: need JOB_ID"))
+		}
+		rec, err := c.JobRecord(fs.Arg(0))
+		if err != nil {
+			die(err)
+		}
+		fmt.Println(string(rec))
 	case "view":
 		if fs.NArg() != 1 {
 			die(fmt.Errorf("view: need DATASET_ID"))
