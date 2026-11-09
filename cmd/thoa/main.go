@@ -39,7 +39,7 @@ const usage = `usage:
                                          run CMD on a VM in a copy of the cwd: -in uploads local files
                                          (mounted at their path under the cwd), -d stages files of dataset
                                          ID at their dataset paths (-i/-e select them); waits, then prints
-                                         the output dataset id (DIR's files, with paths)
+                                         the output dataset id (DIR's files, with paths; also on failure, if any)
                                          -c cores (4), -ram GB (16), -disk GB (20)
                                          -stage FILE stages "path<TAB>file id" lines (any datasets' files)
                                          -env reuses an env with the same stored text (-new-env: don't)
@@ -246,6 +246,9 @@ func main() {
 		}
 		info, err := c.Wait(id)
 		if err != nil {
+			if info != nil && info.OutputDataset != "" {
+				fmt.Println(info.OutputDataset) // a failed job's outputs hold its logs
+			}
 			die(err)
 		}
 		fmt.Println(info.OutputDataset)
