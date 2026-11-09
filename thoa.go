@@ -17,8 +17,10 @@ import (
 )
 
 // ClientVersion is sent as X-Client-Version; the server answers 426 to clients
-// older than its MIN_CLIENT_VERSION. Tracks the python release this ports.
-const ClientVersion = "0.1.8"
+// older than its MIN_CLIENT_VERSION. 0.1.9 adds uploads that finish after the
+// job is created (input_transfer_public_id + client heartbeat); Run uploads
+// first and stages an existing dataset, so it needs neither.
+const ClientVersion = "0.1.9"
 
 type Client struct {
 	BaseURL string // e.g. https://api.thoa.io (no /api suffix)

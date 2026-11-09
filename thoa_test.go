@@ -95,6 +95,7 @@ func fakeThoa(t *testing.T) *fake {
 				w.WriteHeader(201)
 			}
 		case p == "/api/data-transfers":
+			clear(context) // the fake's one dataset holds the latest import
 			reply(map[string]string{"public_id": "t1"})
 		case p == "/api/data-transfers/t1/manifest/unified":
 			var req struct{ Items []map[string]any }
@@ -112,8 +113,15 @@ func fakeThoa(t *testing.T) *fake {
 			reply(map[string]any{"items": items})
 		case p == "/api/data-transfers/t1/manifest":
 			reply(map[string]any{"status": "completed", "total_items": len(context), "completed_paths": []string{}})
-		case p == "/api/data-transfers/t1/resolved-context":
-			reply(map[string]any{"dataset_public_id": "ds1", "input_context": context})
+		case p == "/api/datasets" && r.URL.Query().Get("public_id") == "": // listing, newest first
+			reply([]map[string]any{{"public_id": "other", "number_of_files": len(context), "created_at": "2"},
+				{"public_id": "ds1", "number_of_files": len(context), "created_at": "1"}})
+		case p == "/api/files" && r.URL.Query().Get("dataset_public_id") == "other": // same names, other content
+			var list []map[string]any
+			for _, id := range context {
+				list = append(list, map[string]any{"public_id": "x", "filename": names[id], "hash": "00"})
+			}
+			reply(list)
 		case p == "/api/datasets":
 			ctx := context
 			if f.noContext {
@@ -284,11 +292,11 @@ func TestDatasetPaths(t *testing.T) {
 	}
 }
 
-// Imported datasets have no adjusted_context: paths come from the filenames
-// Upload reported, which must be the dataset paths, not the local ones.
+// Datasets imported before 2026-11 have no adjusted_context: paths come from
+// the filenames Upload reported, which must be the dataset paths, not the
+// local ones. (Upload itself needs the context to find its dataset.)
 func TestRoundTripWithoutContext(t *testing.T) {
 	f := fakeThoa(t)
-	f.noContext = true
 	c := &Client{BaseURL: f.srv.URL, APIKey: "k", HTTP: f.srv.Client(), Blob: f.srv.Client()}
 	Log, retryBackoff, Parallel = nil, time.Millisecond, 4
 
@@ -300,6 +308,7 @@ func TestRoundTripWithoutContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	f.noContext = true
 
 	files, err := c.Files(id)
 	if err != nil || len(files) != 2 || files["a.txt"] == "" || files["sub/b.txt"] == "" {
@@ -325,6 +334,7 @@ func TestRoundTripWithoutContext(t *testing.T) {
 
 	// By file id, from the import's context: independent of filenames, which
 	// keep whatever an earlier upload of the same content named them.
+	f.noContext = false
 	id2, ctx, err := c.UploadContext(map[string]string{"x/a.txt": filepath.Join(src, "a.txt")})
 	if err != nil || ctx["x/a.txt"] == "" {
 		t.Fatalf("UploadContext = %q %v %v", id2, ctx, err)

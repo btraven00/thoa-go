@@ -189,25 +189,53 @@ func (c *Client) UploadContext(files map[string]string) (string, map[string]stri
 	if err := c.waitTransfer(tid); err != nil {
 		return "", nil, err
 	}
-	var resolved struct {
-		DatasetPublicID string            `json:"dataset_public_id"`
-		InputContext    map[string]string `json:"input_context"` // mount path -> file id
+	ds, byMD5, err := c.importedDataset(list)
+	if err != nil {
+		return "", nil, fmt.Errorf("transfer %s: %w", tid, err)
 	}
-	err = retry(func() error { return c.do("GET", "/data-transfers/"+tid+"/resolved-context", nil, nil, &resolved) })
+	ctx := make(map[string]string, len(list))
+	for _, f := range list {
+		ctx[f.name] = byMD5[f.md5]
+	}
+	return ds, ctx, nil
+}
+
+// importedDataset finds the dataset an import just created, and its file ids
+// by md5. Since 2026-11 (client 0.1.9) the server links neither way (GET
+// .../resolved-context is gone; the transfer's dataset_public_id stays null),
+// and its paths can't be trusted: a file that was already on thoa (upload
+// skipped) is stored under its basename (BUGS.txt 10). So match by content and
+// keep the paths client side, as the job's input_context.
+// ponytail: newest of the last 10 datasets holding exactly these md5s; two
+// imports of the same content at once would share one, which is harmless.
+func (c *Client) importedDataset(list []localFile) (string, map[string]string, error) {
+	want := map[string]bool{}
+	for _, f := range list {
+		want[f.md5] = true
+	}
+	all, err := c.Datasets()
 	if err != nil {
 		return "", nil, err
 	}
-	// The dataset itself keeps no path map after an import; input_context is the
-	// only record of it (the python client hands it to the job). Check it maps
-	// exactly the paths we sent.
-	if len(resolved.InputContext) > 0 {
-		for _, f := range list {
-			if resolved.InputContext[f.name] == "" {
-				return resolved.DatasetPublicID, nil, fmt.Errorf("dataset %s: %s missing from the import's input_context", resolved.DatasetPublicID, f.name)
+	for _, d := range all[:min(10, len(all))] {
+		if d.NumberOfFiles < len(want) || d.NumberOfFiles > len(list) {
+			continue
+		}
+		files, err := c.DatasetFiles(d.PublicID)
+		if err != nil {
+			return "", nil, err
+		}
+		byMD5 := map[string]string{}
+		for _, f := range files {
+			if want[f.MD5] {
+				byMD5[f.MD5] = f.ID
 			}
 		}
+		if len(byMD5) == len(want) && len(files) <= len(list) {
+			return d.PublicID, byMD5, nil
+		}
 	}
-	return resolved.DatasetPublicID, resolved.InputContext, nil
+	return "", nil, fmt.Errorf("no recent dataset holds the %d uploaded files", len(list))
 }
 
 // PollInterval is how often transfer status is polled.
