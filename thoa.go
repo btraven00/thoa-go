@@ -50,9 +50,19 @@ func NewClient() (*Client, error) {
 	return &Client{
 		BaseURL: strings.TrimRight(base, "/"),
 		APIKey:  key,
-		HTTP:    &http.Client{Timeout: timeout},
+		HTTP:    &http.Client{Timeout: timeout, Transport: pinging()},
 		Blob:    &http.Client{},
 	}, nil
+}
+
+// pinging is the default transport plus HTTP/2 health checks. A job poll once
+// hung for hours on a dead HTTP/2 connection despite Client.Timeout (stack:
+// http2ClientConn.roundTrip, 2026-11-10); pings close such a connection, so
+// the request fails and retry takes over.
+func pinging() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.HTTP2 = &http.HTTP2Config{SendPingTimeout: 15 * time.Second, PingTimeout: 10 * time.Second}
+	return t
 }
 
 func ConfigPath() string {

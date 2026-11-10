@@ -41,6 +41,7 @@ const usage = `usage:
                                          with -in by content, no data moved); waits, then prints the
                                          output dataset id (DIR's files, with paths; also on failure, if any)
                                          -c cores (4), -ram GB (16), -disk GB (20)
+                                         -stage FILE: with one -d, stage its "path<TAB>file id" lines instead
                                          -env reuses an env with the same stored text (-new-env: don't)
 
 flags: -j N parallel chunk transfers (default 16), -q quiet
@@ -69,6 +70,7 @@ func main() {
 	outDir := fs.String("out", "", "run: output directory, relative to the cwd")
 	var datasets multi
 	fs.Var(&datasets, "d", "run: dataset whose files to stage (repeatable)")
+	stage := fs.String("stage", "", "run: with one -d, stage these \"path<TAB>file id\" lines of it instead")
 	cores := fs.Int("c", 4, "run: cores")
 	ram := fs.Int("ram", 16, "run: RAM in GB")
 	disk := fs.Int("disk", 20, "run: disk in GB")
@@ -175,6 +177,9 @@ func main() {
 		switch {
 		case len(datasets) == 1 && len(inputs) == 0: // one dataset as is: a subset, by id
 			files, err := c.Select(datasets[0], include, exclude)
+			if *stage != "" { // paths chosen by the caller (a job output's listed paths drift)
+				files, err = readStage(*stage)
+			}
 			if err != nil {
 				die(err)
 			}
@@ -220,6 +225,21 @@ func die(err error) {
 
 // relToCwd maps every file under paths to its path relative to the cwd, so it
 // mounts on the VM where it sits locally (thoa mirrors the cwd).
+// readStage reads "path<TAB>file id" lines.
+func readStage(name string) (map[string]string, error) {
+	b, err := os.ReadFile(name)
+	if err != nil {
+		return nil, err
+	}
+	m := map[string]string{}
+	for _, line := range strings.Split(string(b), "\n") {
+		if p, id, ok := strings.Cut(line, "\t"); ok {
+			m[p] = id
+		}
+	}
+	return m, nil
+}
+
 // datasetInputs names the selected files of dataset d by content, at their
 // dataset paths.
 func datasetInputs(c *thoa.Client, d string, include, exclude []string) ([]thoa.Input, error) {
