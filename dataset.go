@@ -240,8 +240,11 @@ func (c *Client) UploadContext(files map[string]string) (string, map[string]stri
 // and its paths can't be trusted: a file that was already on thoa (upload
 // skipped) is stored under its basename (BUGS.txt 10). So match by content and
 // keep the paths client side, as the job's input_context.
-// ponytail: newest of the last 10 datasets holding exactly these md5s; two
-// imports of the same content at once would share one, which is harmless.
+// An import whose files match an existing dataset creates none, so the match
+// can be any dataset, however old.
+// ponytail: newest dataset holding exactly these md5s, listing files only of
+// datasets with a fitting file count; two imports of the same content share
+// one, which is harmless.
 func (c *Client) importedDataset(list []localFile) (string, map[string]string, error) {
 	want := map[string]bool{}
 	for _, f := range list {
@@ -251,7 +254,7 @@ func (c *Client) importedDataset(list []localFile) (string, map[string]string, e
 	if err != nil {
 		return "", nil, err
 	}
-	for _, d := range all[:min(10, len(all))] {
+	for _, d := range all {
 		if d.NumberOfFiles < len(want) || d.NumberOfFiles > len(list) {
 			continue
 		}
