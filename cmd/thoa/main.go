@@ -2,7 +2,7 @@
 //
 //	thoa ls [-l N] [DATASET_ID]
 //	thoa upload PATH...
-//	thoa download [-i PATTERN|ID]... [-e PATTERN|ID]... DATASET_ID DEST
+//	thoa download [-i PATTERN|ID]... [-e PATTERN|ID]... [-stage FILE] DATASET_ID DEST
 //	thoa job JOB_ID
 //	thoa files [-i X]... [-e X]... DATASET_ID
 //	thoa run -cmd CMD (-env FILE | -env-id ID) -out DIR [-in PATH]... [-d DATASET]... [-i X]... [-e X]...
@@ -32,6 +32,7 @@ const usage = `usage:
                                          (a file is stored as its name, a dir DIR as base(DIR)/...)
   thoa download [-i X]... [-e X]... ID DEST
                                          download dataset ID into DEST; X is a path glob or file id
+                                         -stage FILE: download its "path<TAB>file id" lines instead
   thoa job ID                            print a job's record as JSON (status, datasets, costs)
   thoa files [-i X]... [-e X]... ID     print "path<TAB>file id" for the selected files of ID
   thoa run -cmd CMD (-env FILE | -env-id ID) -out DIR [-in PATH]... [-d ID]... [-i X]... [-e X]...
@@ -70,7 +71,7 @@ func main() {
 	outDir := fs.String("out", "", "run: output directory, relative to the cwd")
 	var datasets multi
 	fs.Var(&datasets, "d", "run: dataset whose files to stage (repeatable)")
-	stage := fs.String("stage", "", "run: with one -d, stage these \"path<TAB>file id\" lines of it instead")
+	stage := fs.String("stage", "", "run: with one -d, stage these \"path<TAB>file id\" lines of it instead; download: fetch them")
 	cores := fs.Int("c", 4, "run: cores")
 	ram := fs.Int("ram", 16, "run: RAM in GB")
 	disk := fs.Int("disk", 20, "run: disk in GB")
@@ -121,7 +122,16 @@ func main() {
 		if fs.NArg() != 2 {
 			die(fmt.Errorf("download: need DATASET_ID DEST"))
 		}
-		res, err := c.Download(fs.Arg(0), fs.Arg(1), include, exclude)
+		var res *thoa.DownloadResult
+		if *stage == "" {
+			res, err = c.Download(fs.Arg(0), fs.Arg(1), include, exclude)
+		} else { // by file id: a job output can hold files its listed paths omit (BUGS.txt 14)
+			files, rerr := readStage(*stage)
+			if rerr != nil {
+				die(rerr)
+			}
+			res, err = c.DownloadFiles(fs.Arg(0), files, fs.Arg(1))
+		}
 		if res != nil {
 			fmt.Fprintf(os.Stderr, "downloaded %d, skipped %d, failed %d\n", res.Downloaded, res.Skipped, len(res.Failed))
 		}

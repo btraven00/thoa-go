@@ -10,6 +10,7 @@ thoa upload data/run1                 # prints the new dataset id; files land as
 thoa ls                               # your datasets
 thoa ls [-l N] ID                     # files in a dataset, as a tree
 thoa download [-i GLOB] [-e GLOB] ID DEST
+thoa download -stage TSV ID DEST     # the "path<TAB>file id" lines of TSV, by id
 thoa files [-i GLOB] [-e GLOB] ID     # "path<TAB>file id" lines
 thoa job ID                           # a job's record as JSON, costs included
 thoa run -cmd CMD -env env.yml -out DIR [-in PATH]... [-d ID [-i GLOB]...] [-c 4 -ram 16 -disk 20]
