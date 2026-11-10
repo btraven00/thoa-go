@@ -28,9 +28,106 @@ func logf(format string, args ...any) {
 
 type localFile struct {
 	name string // path inside the dataset
-	path string // local path
+	path string // local path; "" for content already on thoa (md5 and size set)
 	size int64
 	md5  string
+}
+
+// manifest key of a file: its local path, or for content already on thoa a
+// placeholder the server echoes back like one
+func (f *localFile) key() string {
+	if f.path == "" {
+		return "thoa:" + f.md5 + ":" + f.name
+	}
+	return f.path
+}
+
+type pendingUpload struct {
+	url, item string
+	f         *localFile
+}
+
+// prepareTransfer hashes list's local files, creates an import transfer and
+// its manifest (mount path from mount), and returns the uploads it still
+// needs. Content thoa already has is skipped; a file without a local path
+// must be one of those.
+func (c *Client) prepareTransfer(list []localFile, mount func(*localFile) string) (string, []pendingUpload, error) {
+	sort.Slice(list, func(i, j int) bool { return list[i].name < list[j].name })
+	var local []int
+	for i := range list {
+		if list[i].path != "" {
+			local = append(local, i)
+		}
+	}
+	logf("hashing %d files", len(local))
+	err := forEach(len(local), Parallel, func(k int) (err error) {
+		f := &list[local[k]]
+		f.md5, err = md5File(f.path)
+		return err
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	byKey := map[string]*localFile{}
+	items := make([]map[string]any, len(list))
+	for i := range list {
+		f := &list[i]
+		byKey[f.key()] = f
+		items[i] = map[string]any{"provider": "local", "path": f.key(), "md5": f.md5, "size": f.size, "mount_path": mount(f)}
+	}
+
+	var transfer struct {
+		PublicID string `json:"public_id"`
+	}
+	if err := c.do("POST", "/data-transfers", nil, map[string]any{"direction": "import", "remote_ref": map[string]any{}}, &transfer); err != nil {
+		return "", nil, err
+	}
+	tid := transfer.PublicID
+	var manifest struct {
+		Items []struct {
+			Provider       string `json:"provider"`
+			Path           string `json:"path"`
+			UploadRequired bool   `json:"upload_required"`
+			UploadURL      string `json:"upload_url"`
+			ItemPublicID   string `json:"item_public_id"`
+		} `json:"items"`
+	}
+	if err := c.do("POST", "/data-transfers/"+tid+"/manifest/unified", nil, map[string]any{"items": items}, &manifest); err != nil {
+		return "", nil, err
+	}
+	var todo []pendingUpload
+	for _, it := range manifest.Items {
+		if it.Provider != "local" {
+			continue
+		}
+		f := byKey[it.Path]
+		switch {
+		case f == nil:
+			return "", nil, fmt.Errorf("server returned unknown path %q", it.Path)
+		case !it.UploadRequired:
+			logf("skip (already on thoa) %s", f.name)
+		case f.path == "":
+			return "", nil, fmt.Errorf("%s: content %s is not on thoa", f.name, f.md5)
+		default:
+			todo = append(todo, pendingUpload{it.UploadURL, it.ItemPublicID, f})
+		}
+	}
+	return tid, todo, nil
+}
+
+func (c *Client) uploadItems(tid string, todo []pendingUpload) error {
+	sem := make(chan struct{}, max(Parallel, 1))
+	return forEach(len(todo), Parallel, func(i int) error {
+		u := todo[i]
+		logf("upload %s", u.f.name)
+		if err := c.uploadBlob(u.url, u.f.path, u.f.size, u.f.md5, sem); err != nil {
+			return fmt.Errorf("%s: %w", u.f.path, err)
+		}
+		// ponytail: not retried, unknown whether the server treats a repeat as idempotent
+		return c.do("POST", "/data-transfers/"+tid+"/import/items/"+u.item+"/complete", nil,
+			// The server names the file after this, not after mount_path.
+			map[string]any{"filename": u.f.name, "checksum": u.f.md5, "size": u.f.size}, nil)
+	})
 }
 
 // DatasetPaths maps local files/directories to dataset paths: a file becomes
@@ -112,74 +209,11 @@ func (c *Client) UploadContext(files map[string]string) (string, map[string]stri
 		}
 		list = append(list, localFile{name: name, path: p, size: st.Size()})
 	}
-	sort.Slice(list, func(i, j int) bool { return list[i].name < list[j].name })
-
-	logf("hashing %d files", len(list))
-	err := forEach(len(list), Parallel, func(i int) (err error) {
-		list[i].md5, err = md5File(list[i].path)
-		return err
-	})
+	tid, todo, err := c.prepareTransfer(list, func(f *localFile) string { return f.name })
 	if err != nil {
 		return "", nil, err
 	}
-	byPath := map[string]*localFile{}
-	items := make([]map[string]any, len(list))
-	for i := range list {
-		f := &list[i]
-		byPath[f.path] = f
-		items[i] = map[string]any{"provider": "local", "path": f.path, "md5": f.md5, "size": f.size, "mount_path": f.name}
-	}
-
-	var transfer struct {
-		PublicID string `json:"public_id"`
-	}
-	if err := c.do("POST", "/data-transfers", nil, map[string]any{"direction": "import", "remote_ref": map[string]any{}}, &transfer); err != nil {
-		return "", nil, err
-	}
-	tid := transfer.PublicID
-
-	type item struct {
-		Provider       string `json:"provider"`
-		Path           string `json:"path"`
-		UploadRequired bool   `json:"upload_required"`
-		UploadURL      string `json:"upload_url"`
-		ItemPublicID   string `json:"item_public_id"`
-	}
-	var manifest struct {
-		Items []item `json:"items"`
-	}
-	if err := c.do("POST", "/data-transfers/"+tid+"/manifest/unified", nil, map[string]any{"items": items}, &manifest); err != nil {
-		return "", nil, err
-	}
-
-	var todo []item
-	for _, it := range manifest.Items {
-		if it.Provider != "local" {
-			continue
-		}
-		if !it.UploadRequired {
-			logf("skip (already uploaded) %s", it.Path)
-			continue
-		}
-		if byPath[it.Path] == nil {
-			return "", nil, fmt.Errorf("server returned unknown path %q", it.Path)
-		}
-		todo = append(todo, it)
-	}
-
-	sem := make(chan struct{}, max(Parallel, 1))
-	err = forEach(len(todo), Parallel, func(i int) error {
-		it, f := todo[i], byPath[todo[i].Path]
-		logf("upload %s", f.name)
-		if err := c.uploadBlob(it.UploadURL, f.path, f.size, f.md5, sem); err != nil {
-			return fmt.Errorf("%s: %w", f.path, err)
-		}
-		// ponytail: not retried, unknown whether the server treats a repeat as idempotent
-		return c.do("POST", "/data-transfers/"+tid+"/import/items/"+it.ItemPublicID+"/complete", nil,
-			// The server names the file after this, not after mount_path.
-			map[string]any{"filename": f.name, "checksum": f.md5, "size": f.size}, nil)
-	})
-	if err != nil {
+	if err := c.uploadItems(tid, todo); err != nil {
 		return "", nil, err
 	}
 
@@ -371,22 +405,6 @@ func (c *Client) Select(datasetID string, include, exclude []string) (map[string
 		return nil, fmt.Errorf("dataset %s: no files selected", datasetID)
 	}
 	return files, nil
-}
-
-// View makes a new dataset over existing files (ids), moving no data: files
-// are shared, a dataset is a set of them. The new dataset has no path map
-// (thoa ignores a client-set context), so keep files' paths yourself.
-func (c *Client) View(ids []string) (string, error) {
-	if len(ids) == 0 {
-		return "", fmt.Errorf("view: no files")
-	}
-	var ds struct {
-		PublicID string `json:"public_id"`
-	}
-	if err := c.do("POST", "/datasets", nil, map[string]any{"files": ids}, &ds); err != nil {
-		return "", err
-	}
-	return ds.PublicID, nil
 }
 
 // FileInfo is one file of a dataset as /files reports it.

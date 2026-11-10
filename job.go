@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// Job is one thoa job, as the python client's `thoa run` submits it (0.1.8).
+// Job is one thoa job, as the python client's `thoa run` submits it (0.1.9).
 type Job struct {
 	Cmd   string // shell command run on the VM, in Cwd
 	Env   string // conda environment YAML content, registered anew; or
@@ -31,6 +31,18 @@ type Job struct {
 	// Any subset or renaming of a dataset's files works; the ids stay the same.
 	InputDataset string
 	InputContext map[string]string
+
+	// Inputs, instead of InputDataset, stage files through one import bound
+	// to the job (0.1.9): local files are uploaded unless thoa has their
+	// content, files of other datasets are named by content and move no data.
+	Inputs []Input
+}
+
+// Input is a file staged at Path (relative to Cwd): Local is uploaded, or,
+// with Local empty, MD5 (hex) and Size name content already on thoa.
+type Input struct {
+	Path, Local, MD5 string
+	Size             int64
 }
 
 // Job statuses after which nothing changes (python thoa core/job_status.py).
@@ -77,6 +89,39 @@ func (c *Client) Run(j Job) (string, error) {
 		}
 		env.PublicID = id
 	}
+	tid, todo := "", []pendingUpload(nil)
+	if len(j.Inputs) > 0 {
+		// the server stages only the dataset's files when a job has both (2026-11)
+		if j.InputDataset != "" || len(ctx) > 0 {
+			return "", fmt.Errorf("job: Inputs or InputDataset, not both")
+		}
+		list := make([]localFile, len(j.Inputs))
+		for i, in := range j.Inputs {
+			if !validName(in.Path) {
+				return "", fmt.Errorf("input path %q: must be relative and clean", in.Path)
+			}
+			list[i] = localFile{name: in.Path, path: in.Local, md5: in.MD5, size: in.Size}
+			if in.Local != "" {
+				st, err := os.Stat(in.Local)
+				if err != nil {
+					return "", err
+				}
+				list[i].size = st.Size()
+			}
+		}
+		var err error
+		tid, todo, err = c.prepareTransfer(list, func(f *localFile) string {
+			return path.Join(filepath.ToSlash(j.Cwd), f.name)
+		})
+		if err != nil {
+			return "", err
+		}
+	}
+
+	var transfer any // null without Inputs
+	if tid != "" {
+		transfer = tid
+	}
 	var script, job idOnly
 	if err := c.do("POST", "/scripts", nil, map[string]any{
 		"name": "thoa-go script", "script_content": j.Cmd,
@@ -86,8 +131,8 @@ func (c *Client) Run(j Job) (string, error) {
 	}
 	if err := c.do("POST", "/jobs", nil, map[string]any{
 		"requested_ram": j.RAMGB, "requested_cpu": j.Cores, "requested_disk_space": j.DiskGB,
-		"has_input_data": j.InputDataset != "" || len(ctx) > 0, "client_home": home,
-		"use_existing_input_dataset": false, "import_transfer_public_id": nil,
+		"has_input_data": j.InputDataset != "" || len(ctx) > 0 || tid != "", "client_home": home,
+		"use_existing_input_dataset": false, "input_transfer_public_id": transfer,
 		"export_transfer_public_id": nil, "input_mount_root": nil,
 		"strict": false, "max_attempts": 3, "disable_preflight": false,
 	}, &job); err != nil {
@@ -108,11 +153,46 @@ func (c *Client) Run(j Job) (string, error) {
 		c.do("POST", "/jobs/"+job.PublicID+"/cancel", nil, nil, nil)
 		return "", fmt.Errorf("job %s: %w", job.PublicID, err)
 	}
+	if tid != "" {
+		if err := c.feed(tid, todo); err != nil {
+			c.do("POST", "/jobs/"+job.PublicID+"/cancel", nil, nil, nil)
+			return "", fmt.Errorf("job %s inputs: %w", job.PublicID, err)
+		}
+	}
 	logf("job %s submitted (env %s)", job.PublicID, env.PublicID)
 	// The python client polls /environments/{id}/validate in the background
 	// to get the build going; do it once here, Wait keeps it up.
 	c.do("GET", "/environments/"+env.PublicID+"/validate", nil, nil, nil)
 	return job.PublicID, nil
+}
+
+// feed starts a job's import and uploads what it still needs. The server fails
+// the job if the uploader goes quiet for 10 minutes, so beat while uploading.
+// The job stages each file as it lands; nothing waits for the whole import.
+func (c *Client) feed(tid string, todo []pendingUpload) error {
+	if err := c.do("POST", "/data-transfers/"+tid+"/start", nil, nil, nil); err != nil {
+		return err
+	}
+	if len(todo) == 0 {
+		return nil
+	}
+	beat := func() { c.do("POST", "/data-transfers/"+tid+"/client-heartbeat", nil, nil, nil) }
+	beat()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				beat()
+			}
+		}
+	}()
+	return c.uploadItems(tid, todo)
 }
 
 // JobInfo is the part of GET /jobs that Wait reports.

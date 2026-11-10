@@ -4,8 +4,8 @@
 //	thoa upload PATH...
 //	thoa download [-i PATTERN|ID]... [-e PATTERN|ID]... DATASET_ID DEST
 //	thoa job JOB_ID
-//	thoa view [-i X]... [-e X]... DATASET_ID
-//	thoa run -cmd CMD (-env FILE | -env-id ID) -out DIR [-in PATH]... [-d DATASET [-i X]... [-e X]...]
+//	thoa files [-i X]... [-e X]... DATASET_ID
+//	thoa run -cmd CMD (-env FILE | -env-id ID) -out DIR [-in PATH]... [-d DATASET]... [-i X]... [-e X]...
 package main
 
 import (
@@ -33,15 +33,14 @@ const usage = `usage:
   thoa download [-i X]... [-e X]... ID DEST
                                          download dataset ID into DEST; X is a path glob or file id
   thoa job ID                            print a job's record as JSON (status, datasets, costs)
-  thoa view [-i X]... [-e X]... ID      new dataset over the selected files of ID (no data moved);
-                                         prints its id, then "path<TAB>file id" per file (it keeps no paths)
-  thoa run -cmd CMD (-env FILE | -env-id ID) -out DIR [-in PATH]... [-d ID [-i X]... [-e X]...]
+  thoa files [-i X]... [-e X]... ID     print "path<TAB>file id" for the selected files of ID
+  thoa run -cmd CMD (-env FILE | -env-id ID) -out DIR [-in PATH]... [-d ID]... [-i X]... [-e X]...
                                          run CMD on a VM in a copy of the cwd: -in uploads local files
                                          (mounted at their path under the cwd), -d stages files of dataset
-                                         ID at their dataset paths (-i/-e select them); waits, then prints
-                                         the output dataset id (DIR's files, with paths; also on failure, if any)
+                                         ID at their dataset paths (-i/-e select them; repeatable, mixed
+                                         with -in by content, no data moved); waits, then prints the
+                                         output dataset id (DIR's files, with paths; also on failure, if any)
                                          -c cores (4), -ram GB (16), -disk GB (20)
-                                         -stage FILE stages "path<TAB>file id" lines (any datasets' files)
                                          -env reuses an env with the same stored text (-new-env: don't)
 
 flags: -j N parallel chunk transfers (default 16), -q quiet
@@ -68,9 +67,8 @@ func main() {
 	envID := fs.String("env-id", "", "run: existing environment id (logged by an earlier run)")
 	newEnv := fs.Bool("new-env", false, "run: register -env anew instead of reusing an identical one")
 	outDir := fs.String("out", "", "run: output directory, relative to the cwd")
-	dataset := fs.String("d", "", "run: dataset whose files to stage")
-	var stage multi
-	fs.Var(&stage, "stage", "run: file of \"path<TAB>file id\" lines to stage, as thoa view prints (repeatable)")
+	var datasets multi
+	fs.Var(&datasets, "d", "run: dataset whose files to stage (repeatable)")
 	cores := fs.Int("c", 4, "run: cores")
 	ram := fs.Int("ram", 16, "run: RAM in GB")
 	disk := fs.Int("disk", 20, "run: disk in GB")
@@ -140,9 +138,9 @@ func main() {
 			die(err)
 		}
 		fmt.Println(string(rec))
-	case "view":
+	case "files":
 		if fs.NArg() != 1 {
-			die(fmt.Errorf("view: need DATASET_ID"))
+			die(fmt.Errorf("files: need DATASET_ID"))
 		}
 		files, err := c.Select(fs.Arg(0), include, exclude)
 		if err != nil {
@@ -153,15 +151,6 @@ func main() {
 			paths = append(paths, p)
 		}
 		sort.Strings(paths)
-		ids := make([]string, len(paths))
-		for i, p := range paths {
-			ids[i] = files[p]
-		}
-		id, err := c.View(ids)
-		if err != nil {
-			die(err)
-		}
-		fmt.Println(id)
 		for _, p := range paths {
 			fmt.Printf("%s\t%s\n", p, files[p])
 		}
@@ -183,62 +172,28 @@ func main() {
 				}
 			}
 		}
-		if *dataset != "" {
-			j.InputDataset = *dataset
-			// with -stage, the map comes from there; a view has no paths to select by
-			if len(stage) == 0 || len(include)+len(exclude) > 0 {
-				files, err := c.Select(*dataset, include, exclude)
-				if err != nil {
-					die(err)
-				}
-				j.InputContext = files
-			}
-		}
-		for _, f := range stage {
-			b, err := os.ReadFile(f)
+		switch {
+		case len(datasets) == 1 && len(inputs) == 0: // one dataset as is: a subset, by id
+			files, err := c.Select(datasets[0], include, exclude)
 			if err != nil {
 				die(err)
 			}
-			for _, line := range strings.Split(string(b), "\n") {
-				if p, id, ok := strings.Cut(line, "\t"); ok {
-					j.InputContext[p] = id
+			j.InputDataset, j.InputContext = datasets[0], files
+		case len(datasets)+len(inputs) > 0: // one import; -d files must be imported content (job outputs aren't)
+			for _, d := range datasets {
+				in, err := datasetInputs(c, d, include, exclude)
+				if err != nil {
+					die(err)
 				}
+				j.Inputs = append(j.Inputs, in...)
 			}
-		}
-		if len(inputs) > 0 {
 			files, err := relToCwd(inputs)
 			if err != nil {
 				die(err)
 			}
-			id, ctx, err := c.UploadContext(files)
-			if err != nil {
-				die(err)
+			for p, local := range files {
+				j.Inputs = append(j.Inputs, thoa.Input{Path: p, Local: local})
 			}
-			if j.InputDataset == "" && len(j.InputContext) == 0 {
-				j.InputDataset = id
-			}
-			for p, fid := range ctx {
-				j.InputContext[p] = fid
-			}
-		}
-		// thoa stages input_context only for files of the job's input dataset
-		// and drops other ids silently, so mixed inputs (-in with -stage or -d,
-		// or -stage alone) go through one view over all of them: no data moves.
-		if len(j.InputContext) > 0 && (len(stage) > 0 || len(inputs) > 0 && *dataset != "") {
-			seen := map[string]bool{} // identical files share an id (md5 dedup)
-			ids := make([]string, 0, len(j.InputContext))
-			for _, fid := range j.InputContext {
-				if !seen[fid] {
-					seen[fid] = true
-					ids = append(ids, fid)
-				}
-			}
-			v, err := c.View(ids)
-			if err != nil {
-				die(err)
-			}
-			fmt.Fprintf(os.Stderr, "input view %s over %d files\n", v, len(ids))
-			j.InputDataset = v
 		}
 		id, err := c.Run(j)
 		if err != nil {
@@ -265,6 +220,32 @@ func die(err error) {
 
 // relToCwd maps every file under paths to its path relative to the cwd, so it
 // mounts on the VM where it sits locally (thoa mirrors the cwd).
+// datasetInputs names the selected files of dataset d by content, at their
+// dataset paths.
+func datasetInputs(c *thoa.Client, d string, include, exclude []string) ([]thoa.Input, error) {
+	sel, err := c.Select(d, include, exclude)
+	if err != nil {
+		return nil, err
+	}
+	info, err := c.DatasetFiles(d)
+	if err != nil {
+		return nil, err
+	}
+	byID := map[string]thoa.FileInfo{}
+	for _, f := range info {
+		byID[f.ID] = f
+	}
+	var in []thoa.Input
+	for p, id := range sel {
+		f, ok := byID[id]
+		if !ok || f.MD5 == "" {
+			return nil, fmt.Errorf("dataset %s: no md5 for %s", d, p)
+		}
+		in = append(in, thoa.Input{Path: p, MD5: f.MD5, Size: f.Size})
+	}
+	return in, nil
+}
+
 func relToCwd(paths []string) (map[string]string, error) {
 	wd, err := os.Getwd()
 	if err != nil {
