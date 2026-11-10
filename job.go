@@ -49,7 +49,7 @@ type Input struct {
 var terminal = map[string]bool{
 	"completed": true, "failed_execution": true, "failed_validation": true,
 	"failed_provisioning": true, "failed_upload": true, "failed_startup": true,
-	"cancelled": true,
+	"cancelled": true, "crashed": true, // thoa doesn't retry a crash during provisioning (job e385a99b)
 }
 
 type idOnly struct {
