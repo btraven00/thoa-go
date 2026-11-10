@@ -2,7 +2,8 @@
 //
 //	thoa ls [-l N] [DATASET_ID]
 //	thoa upload PATH...
-//	thoa download [-i PATTERN|ID]... [-e PATTERN|ID]... [-stage FILE] DATASET_ID DEST
+//	thoa download [-i PATTERN|ID]... [-e PATTERN|ID]... [-context FILE] DATASET_ID DEST
+//	thoa download -job [-i PATTERN|ID]... [-e PATTERN|ID]... JOB_ID DEST
 //	thoa job JOB_ID
 //	thoa files [-i X]... [-e X]... DATASET_ID
 //	thoa run -cmd CMD (-env FILE | -env-id ID) -out DIR [-in PATH]... [-d DATASET]... [-i X]... [-e X]...
@@ -32,7 +33,9 @@ const usage = `usage:
                                          (a file is stored as its name, a dir DIR as base(DIR)/...)
   thoa download [-i X]... [-e X]... ID DEST
                                          download dataset ID into DEST; X is a path glob or file id
-                                         -stage FILE: download its "path<TAB>file id" lines instead
+                                         -context FILE: download its "path<TAB>file id" lines instead
+  thoa download -job [-i X]... [-e X]... JOB_ID DEST
+                                         download a job's outputs at the paths of its output_context
   thoa job ID                            print a job's record as JSON (status, datasets, costs)
   thoa files [-i X]... [-e X]... ID     print "path<TAB>file id" for the selected files of ID
   thoa run -cmd CMD (-env FILE | -env-id ID) -out DIR [-in PATH]... [-d ID]... [-i X]... [-e X]...
@@ -42,7 +45,8 @@ const usage = `usage:
                                          with -in by content, no data moved); waits, then prints the
                                          output dataset id (DIR's files, with paths; also on failure, if any)
                                          -c cores (4), -ram GB (16), -disk GB (20)
-                                         -stage FILE: with one -d, stage its "path<TAB>file id" lines instead
+                                         -context FILE: with one -d, its "path<TAB>file id" lines are the
+                                         job's input_context instead
                                          -env reuses an env with the same stored text (-new-env: don't)
 
 flags: -j N parallel chunk transfers (default 16), -q quiet
@@ -71,7 +75,8 @@ func main() {
 	outDir := fs.String("out", "", "run: output directory, relative to the cwd")
 	var datasets multi
 	fs.Var(&datasets, "d", "run: dataset whose files to stage (repeatable)")
-	stage := fs.String("stage", "", "run: with one -d, stage these \"path<TAB>file id\" lines of it instead; download: fetch them")
+	context := fs.String("context", "", "run: with one -d, input_context as \"path<TAB>file id\" lines; download: fetch those")
+	byJob := fs.Bool("job", false, "download: the argument is a job id; fetch its outputs")
 	cores := fs.Int("c", 4, "run: cores")
 	ram := fs.Int("ram", 16, "run: RAM in GB")
 	disk := fs.Int("disk", 20, "run: disk in GB")
@@ -120,17 +125,20 @@ func main() {
 		fmt.Println(id)
 	case "download":
 		if fs.NArg() != 2 {
-			die(fmt.Errorf("download: need DATASET_ID DEST"))
+			die(fmt.Errorf("download: need DATASET_ID (or -job JOB_ID) DEST"))
 		}
 		var res *thoa.DownloadResult
-		if *stage == "" {
-			res, err = c.Download(fs.Arg(0), fs.Arg(1), include, exclude)
-		} else { // by file id: a job output can hold files its listed paths omit (BUGS.txt 14)
-			files, rerr := readStage(*stage)
+		switch {
+		case *byJob:
+			res, err = c.DownloadJob(fs.Arg(0), fs.Arg(1), include, exclude)
+		case *context != "":
+			files, rerr := readContext(*context)
 			if rerr != nil {
 				die(rerr)
 			}
 			res, err = c.DownloadFiles(fs.Arg(0), files, fs.Arg(1))
+		default:
+			res, err = c.Download(fs.Arg(0), fs.Arg(1), include, exclude)
 		}
 		if res != nil {
 			fmt.Fprintf(os.Stderr, "downloaded %d, skipped %d, failed %d\n", res.Downloaded, res.Skipped, len(res.Failed))
@@ -187,8 +195,8 @@ func main() {
 		switch {
 		case len(datasets) == 1 && len(inputs) == 0: // one dataset as is: a subset, by id
 			files, err := c.Select(datasets[0], include, exclude)
-			if *stage != "" { // paths chosen by the caller (a job output's listed paths drift)
-				files, err = readStage(*stage)
+			if *context != "" { // paths chosen by the caller (a job output's listed paths drift)
+				files, err = readContext(*context)
 			}
 			if err != nil {
 				die(err)
@@ -235,8 +243,8 @@ func die(err error) {
 
 // relToCwd maps every file under paths to its path relative to the cwd, so it
 // mounts on the VM where it sits locally (thoa mirrors the cwd).
-// readStage reads "path<TAB>file id" lines.
-func readStage(name string) (map[string]string, error) {
+// readContext reads a context: "path<TAB>file id" lines.
+func readContext(name string) (map[string]string, error) {
 	b, err := os.ReadFile(name)
 	if err != nil {
 		return nil, err

@@ -223,6 +223,55 @@ func (c *Client) JobRecord(id string) (json.RawMessage, error) {
 	return rec, err
 }
 
+// JobOutputs is a job's output dataset and its files, by path relative to the
+// job's working directory, from the record's output_context. The dataset's
+// own listed paths drift or omit files (BUGS.txt 12, 14); this map doesn't.
+func (c *Client) JobOutputs(id string) (string, map[string]string, error) {
+	raw, err := c.JobRecord(id)
+	if err != nil {
+		return "", nil, err
+	}
+	var rec struct {
+		DatasetID string `json:"output_dataset_public_id"`
+		Dataset   *struct {
+			ID string `json:"public_id"`
+		} `json:"output_dataset"`
+		Cwd     string            `json:"current_working_directory"`
+		Context map[string]string `json:"output_context"`
+	}
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		return "", nil, err
+	}
+	ds := rec.DatasetID
+	if ds == "" && rec.Dataset != nil {
+		ds = rec.Dataset.ID
+	}
+	if ds == "" {
+		return "", nil, fmt.Errorf("job %s: no output dataset", id)
+	}
+	cwd := strings.TrimRight(rec.Cwd, "/") + "/"
+	files := map[string]string{}
+	for p, f := range rec.Context {
+		if rel, ok := strings.CutPrefix(p, cwd); ok {
+			files[rel] = f
+		}
+	}
+	return ds, files, nil
+}
+
+// DownloadJob downloads a job's outputs selected by include/exclude (path
+// globs or file ids) into dest, at their JobOutputs paths.
+func (c *Client) DownloadJob(id, dest string, include, exclude []string) (*DownloadResult, error) {
+	ds, files, err := c.JobOutputs(id)
+	if err != nil {
+		return nil, err
+	}
+	if files = filterFiles(files, include, exclude); len(files) == 0 {
+		return nil, fmt.Errorf("job %s: no outputs selected", id)
+	}
+	return c.DownloadFiles(ds, files, dest)
+}
+
 // JobPoll is how often Wait polls job status.
 var JobPoll = 5 * time.Second
 

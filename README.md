@@ -10,7 +10,8 @@ thoa upload data/run1                 # prints the new dataset id; files land as
 thoa ls                               # your datasets
 thoa ls [-l N] ID                     # files in a dataset, as a tree
 thoa download [-i GLOB] [-e GLOB] ID DEST
-thoa download -stage TSV ID DEST     # the "path<TAB>file id" lines of TSV, by id
+thoa download -context TSV ID DEST   # the "path<TAB>file id" lines of TSV, by file id
+thoa download -job [-i GLOB] JOB DEST # a job's outputs, at the paths of its output_context
 thoa files [-i GLOB] [-e GLOB] ID     # "path<TAB>file id" lines
 thoa job ID                           # a job's record as JSON, costs included
 thoa run -cmd CMD -env env.yml -out DIR [-in PATH]... [-d ID [-i GLOB]...] [-c 4 -ram 16 -disk 20]
@@ -19,7 +20,7 @@ thoa run -cmd CMD -env env.yml -out DIR [-in PATH]... [-d ID [-i GLOB]...] [-c 4
 
 `run` is a port of python `thoa run` minus log streaming and Google Drive. One `-d`
 stages a chosen subset of an existing dataset's files by id (`input_context`),
-which the python client can't do; `-stage FILE` gives the paths instead
+which the python client can't do; `-context FILE` gives that map instead
 (`thoa files` lines). A job takes one dataset: several `-d`, or `-d` with
 `-in`, only work for content that was imported, never for job outputs.
 A job's output dataset keeps its paths; an import keeps them except for
