@@ -1,5 +1,5 @@
 // Package thoa is a Go port of the dataset (data lake) and run parts of the thoa CLI
-// (https://pypi.org/project/thoa/, ported from 0.1.8): upload local files as a
+// (https://pypi.org/project/thoa/, ported from 0.1.9): upload local files as a
 // dataset, download a dataset by id.
 package thoa
 

@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// TestRunWait checks the payloads Run sends (the python client's, 0.1.8) and
+// TestRunWait checks the payloads Run sends (the python client's, 0.1.9) and
 // that Wait follows a job to completion and its output dataset.
 func TestRunWait(t *testing.T) {
 	got := map[string]map[string]any{} // "METHOD path" -> body
